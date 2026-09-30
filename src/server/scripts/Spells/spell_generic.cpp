@@ -4555,7 +4555,8 @@ class spell_gen_throw_torch : public SpellScript
 
     void HandleEffect()
     {
-        if (Player* player = GetCaster()->ToPlayer())
+        // Throw Torch is a vehicle spell (Crowley's Horse, quest 14212): the caster is the horse, credit its rider
+        if (Player* player = GetCaster()->GetCharmerOrOwnerPlayerOrPlayerItself())
             if (GetHitUnit() && !GetHitUnit()->HasAura(SPELL_THROW_TORCH))
                 player->KilledMonsterCredit(CREDIT_ROUND_UP_WORGEN);
     }

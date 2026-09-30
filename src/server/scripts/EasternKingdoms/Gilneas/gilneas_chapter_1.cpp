@@ -19,6 +19,7 @@
 #include "ScriptMgr.h"
 #include "CombatAI.h"
 #include "MotionMaster.h"
+#include "MoveSpline.h"
 #include "ObjectAccessor.h"
 #include "Player.h"
 #include "PassiveAI.h"
@@ -516,6 +517,7 @@ enum CrowleysHorse
     EVENT_MOVE_PATH_MAIN_1,
     EVENT_MOVE_PATH_MAIN_2,
     EVENT_MOVE_OFF_PATH = 6,
+    EVENT_CHECK_PATH,
 
     PATH_ID_CROWLEYS_HORSE_1    = 352310,
     PATH_ID_CROWLEYS_HORSE_2    = 352311,
@@ -523,6 +525,8 @@ enum CrowleysHorse
 
     SPELL_THROW_TORCH           = 67063,
     NPC_CROWLEYS_HORSE_2        = 44428,
+
+    CROWLEYS_HORSE_MAX_STUCK_CHECKS = 10 // 1s checks without movement before the player is dismounted as fail-safe
 };
 
 static Position const CrowleysHorseJumpPos = { -1714.762f, 1673.16f, 20.49182f };
@@ -530,7 +534,11 @@ static Position const CrowleysHorseJumpPos2 = { -1566.71f, 1708.04f, 20.4849f };
 
 struct npc_crowleys_horse : public VehicleAI
 {
-    npc_crowleys_horse(Creature* creature) : VehicleAI(creature), _currentPath(0) { }
+    npc_crowleys_horse(Creature* creature) : VehicleAI(creature), _currentPath(0), _pathActive(false), _stuckChecks(0) { }
+
+    // The horse runs a scripted route with the player locked in the seat. It must never evade: CreatureAI::EnterEvadeMode
+    // would replace the waypoint path with following its charmer (= its own rider) and the horse would stand still.
+    void EnterEvadeMode(EvadeReason /*why*/) override { }
 
     void PassengerBoarded(Unit* passenger, int8 /*seatId*/, bool apply) override
     {
@@ -548,12 +556,35 @@ struct npc_crowleys_horse : public VehicleAI
 
     void MovementInform(uint32 type, uint32 pointId) override
     {
-        if (type == WAYPOINT_MOTION_TYPE && pointId == 14 && _currentPath == PATH_ID_CROWLEYS_HORSE_1)
+        if (type != WAYPOINT_MOTION_TYPE)
+            return;
+
+        _stuckChecks = 0;
+
+        if (pointId == 14 && _currentPath == PATH_ID_CROWLEYS_HORSE_1)
+        {
+            _pathActive = false;
             _events.ScheduleEvent(EVENT_JUMP_OVER_BARRICADES_2, 1s);
-        else if (type == WAYPOINT_MOTION_TYPE && pointId == 15 && _currentPath == PATH_ID_CROWLEYS_HORSE_2)
+        }
+        else if (pointId == 15 && _currentPath == PATH_ID_CROWLEYS_HORSE_2)
+        {
+            _pathActive = false;
             _events.ScheduleEvent(EVENT_DISMOUNT_PLAYER, 1ms);
-        else if (type == WAYPOINT_MOTION_TYPE && pointId == 16 && _currentPath == PATH_ID_CROWLEYS_HORSE_3)
+        }
+        else if (pointId == 16 && _currentPath == PATH_ID_CROWLEYS_HORSE_3)
+        {
+            _pathActive = false;
             _events.ScheduleEvent(EVENT_DISMOUNT_PLAYER, 1ms);
+        }
+    }
+
+    void StartPath(uint32 pathId)
+    {
+        _currentPath = pathId;
+        _pathActive = true;
+        _stuckChecks = 0;
+        me->GetMotionMaster()->MovePath(pathId, false);
+        _events.RescheduleEvent(EVENT_CHECK_PATH, 1s);
     }
 
     void UpdateAI(uint32 diff) override
@@ -570,19 +601,18 @@ struct npc_crowleys_horse : public VehicleAI
                     _events.ScheduleEvent(EVENT_MOVE_PATH_MAIN_1, 2s);
                     break;
                 case EVENT_MOVE_PATH_MAIN_1:
-                    me->GetMotionMaster()->MovePath(PATH_ID_CROWLEYS_HORSE_1, false);
-                    _currentPath = PATH_ID_CROWLEYS_HORSE_1;
+                    StartPath(PATH_ID_CROWLEYS_HORSE_1);
                     break;
                 case EVENT_JUMP_OVER_BARRICADES_2:
                     me->GetMotionMaster()->MoveJump(CrowleysHorseJumpPos2, 16.0f, 18.56182f);
                     _events.ScheduleEvent(EVENT_MOVE_PATH_MAIN_2, 2s);
                     break;
                 case EVENT_MOVE_PATH_MAIN_2:
-                    _currentPath = PATH_ID_CROWLEYS_HORSE_2;
-                    me->GetMotionMaster()->MovePath(PATH_ID_CROWLEYS_HORSE_2, false);
+                    StartPath(PATH_ID_CROWLEYS_HORSE_2);
                     break;
                 case EVENT_DISMOUNT_PLAYER:
                 {
+                    _pathActive = false;
                     std::set<Unit*> attackersCopy = me->getAttackers();
                     for (Unit* attacker : attackersCopy)
                     {
@@ -597,8 +627,30 @@ struct npc_crowleys_horse : public VehicleAI
                 }
                 case EVENT_MOVE_OFF_PATH:
                     me->SetControlled(false, UNIT_STATE_ROOT);
-                    _currentPath = PATH_ID_CROWLEYS_HORSE_3;
-                    me->GetMotionMaster()->MovePath(PATH_ID_CROWLEYS_HORSE_3, false);
+                    StartPath(PATH_ID_CROWLEYS_HORSE_3);
+                    break;
+                case EVENT_CHECK_PATH:
+                    if (!_pathActive)
+                        break;
+
+                    // WaypointMovementGenerator does not relaunch a leg once its spline got stopped or replaced (e.g. while the
+                    // horse was briefly not allowed to move), it then idles forever and MovementInform never fires. Resume it.
+                    if (me->movespline->Finalized())
+                    {
+                        if (me->GetMotionMaster()->GetCurrentMovementGeneratorType() == WAYPOINT_MOTION_TYPE && !me->HasUnitState(UNIT_STATE_NOT_MOVE))
+                            me->ResumeMovement(0, MOTION_SLOT_IDLE);
+
+                        // fail-safe: never leave the player locked on a horse that does not move anymore
+                        if (++_stuckChecks >= CROWLEYS_HORSE_MAX_STUCK_CHECKS)
+                        {
+                            _events.ScheduleEvent(EVENT_DISMOUNT_PLAYER, 1ms);
+                            break;
+                        }
+                    }
+                    else
+                        _stuckChecks = 0;
+
+                    _events.Repeat(1s);
                     break;
                 default:
                     break;
@@ -608,6 +660,8 @@ struct npc_crowleys_horse : public VehicleAI
 private:
     EventMap _events;
     uint32 _currentPath;
+    bool _pathActive;
+    uint8 _stuckChecks;
 };
 
 enum GileanCrow
