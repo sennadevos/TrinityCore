@@ -29,6 +29,8 @@
 #include "SpellScript.h"
 #include "TemporarySummon.h"
 #include "Vehicle.h"
+#include "WaypointManager.h"
+#include <limits>
 
 namespace Gilneas::Chapter1
 {
@@ -537,18 +539,20 @@ struct npc_crowleys_horse : public VehicleAI
     npc_crowleys_horse(Creature* creature) : VehicleAI(creature), _currentPath(0), _pathActive(false), _stuckChecks(0) { }
 
     // The horse runs a scripted route with the player locked in the seat. It must never evade: CreatureAI::EnterEvadeMode
-    // would replace the waypoint path with following its charmer (= its own rider) and the horse would stand still.
+    // would replace the route with following its charmer (= its own rider) and the horse would stand still.
     void EnterEvadeMode(EvadeReason /*why*/) override { }
 
     void PassengerBoarded(Unit* passenger, int8 /*seatId*/, bool apply) override
     {
         if (apply && passenger->GetTypeId() == TYPEID_PLAYER && me->GetEntry() != NPC_CROWLEYS_HORSE_2)
         {
+            me->SetReactState(REACT_PASSIVE);
             me->SetControlled(true, UNIT_STATE_ROOT);
             _events.ScheduleEvent(EVENT_JUMP_OVER_BARRICADES_1, 2s);
         }
         else if (apply && passenger->GetTypeId() == TYPEID_PLAYER)
         {
+            me->SetReactState(REACT_PASSIVE);
             me->SetControlled(true, UNIT_STATE_ROOT);
             _events.ScheduleEvent(EVENT_MOVE_OFF_PATH, 2s);
         }
@@ -556,26 +560,23 @@ struct npc_crowleys_horse : public VehicleAI
 
     void MovementInform(uint32 type, uint32 pointId) override
     {
-        if (type != WAYPOINT_MOTION_TYPE)
+        // GenericMovementGenerator also informs when the spline got interrupted: only a finished route counts,
+        // an interrupted one is relaunched by EVENT_CHECK_PATH.
+        if (type != EFFECT_MOTION_TYPE || !_pathActive || pointId != _currentPath || !IsAtPathEnd())
             return;
 
+        OnPathEnded();
+    }
+
+    void OnPathEnded()
+    {
+        _pathActive = false;
         _stuckChecks = 0;
 
-        if (pointId == 14 && _currentPath == PATH_ID_CROWLEYS_HORSE_1)
-        {
-            _pathActive = false;
+        if (_currentPath == PATH_ID_CROWLEYS_HORSE_1)
             _events.ScheduleEvent(EVENT_JUMP_OVER_BARRICADES_2, 1s);
-        }
-        else if (pointId == 15 && _currentPath == PATH_ID_CROWLEYS_HORSE_2)
-        {
-            _pathActive = false;
+        else
             _events.ScheduleEvent(EVENT_DISMOUNT_PLAYER, 1ms);
-        }
-        else if (pointId == 16 && _currentPath == PATH_ID_CROWLEYS_HORSE_3)
-        {
-            _pathActive = false;
-            _events.ScheduleEvent(EVENT_DISMOUNT_PLAYER, 1ms);
-        }
     }
 
     void StartPath(uint32 pathId)
@@ -583,8 +584,61 @@ struct npc_crowleys_horse : public VehicleAI
         _currentPath = pathId;
         _pathActive = true;
         _stuckChecks = 0;
-        me->GetMotionMaster()->MovePath(pathId, false);
+        LaunchPath(0);
         _events.RescheduleEvent(EVENT_CHECK_PATH, 1s);
+    }
+
+    // Crowley's Horse is sessile (StaticFlags 0x100 = permanently UNIT_STATE_ROOT, SetControlled(false, ROOT) is ignored),
+    // so WaypointMovementGenerator (MovePath) never starts moving it. Send the DB waypoints as one spline instead,
+    // like npc_greymanes_horse does. fromNode: first node still to be reached.
+    void LaunchPath(size_t fromNode)
+    {
+        WaypointPath const* path = sWaypointMgr->GetPath(_currentPath);
+        if (!path || fromNode >= path->Nodes.size())
+            return;
+
+        std::vector<Position> points;
+        points.reserve(path->Nodes.size() - fromNode + 1);
+        points.push_back(me->GetPosition()); // the first vertex is replaced by the current position in MoveSplineInit::Launch
+        for (size_t i = fromNode; i < path->Nodes.size(); ++i)
+            points.emplace_back(path->Nodes[i].X, path->Nodes[i].Y, path->Nodes[i].Z);
+
+        me->GetMotionMaster()->MoveSmoothPath(_currentPath, points.data(), points.size());
+    }
+
+    bool IsAtPathEnd() const
+    {
+        WaypointPath const* path = sWaypointMgr->GetPath(_currentPath);
+        if (!path || path->Nodes.empty())
+            return true;
+
+        WaypointNode const& node = path->Nodes.back();
+        return me->GetExactDist2d(node.X, node.Y) < 5.0f;
+    }
+
+    // node to continue with after an interruption: the one after the closest node (or the closest one if not reached yet)
+    size_t GetResumeNode() const
+    {
+        WaypointPath const* path = sWaypointMgr->GetPath(_currentPath);
+        if (!path || path->Nodes.empty())
+            return 0;
+
+        size_t closest = 0;
+        float closestDist = std::numeric_limits<float>::max();
+        for (size_t i = 0; i < path->Nodes.size(); ++i)
+        {
+            float dist = me->GetExactDist2d(path->Nodes[i].X, path->Nodes[i].Y);
+            if (dist < closestDist)
+            {
+                closestDist = dist;
+                closest = i;
+            }
+        }
+
+        if (closestDist < 3.0f && closest + 1 < path->Nodes.size())
+            ++closest;
+
+        return closest;
     }
 
     void UpdateAI(uint32 diff) override
@@ -601,6 +655,11 @@ struct npc_crowleys_horse : public VehicleAI
                     _events.ScheduleEvent(EVENT_MOVE_PATH_MAIN_1, 2s);
                     break;
                 case EVENT_MOVE_PATH_MAIN_1:
+                    if (me->movespline->isParabolic() && !me->movespline->Finalized())
+                    {
+                        _events.Repeat(200ms); // let the jump land first
+                        break;
+                    }
                     StartPath(PATH_ID_CROWLEYS_HORSE_1);
                     break;
                 case EVENT_JUMP_OVER_BARRICADES_2:
@@ -608,6 +667,11 @@ struct npc_crowleys_horse : public VehicleAI
                     _events.ScheduleEvent(EVENT_MOVE_PATH_MAIN_2, 2s);
                     break;
                 case EVENT_MOVE_PATH_MAIN_2:
+                    if (me->movespline->isParabolic() && !me->movespline->Finalized())
+                    {
+                        _events.Repeat(200ms);
+                        break;
+                    }
                     StartPath(PATH_ID_CROWLEYS_HORSE_2);
                     break;
                 case EVENT_DISMOUNT_PLAYER:
@@ -633,12 +697,13 @@ struct npc_crowleys_horse : public VehicleAI
                     if (!_pathActive)
                         break;
 
-                    // WaypointMovementGenerator does not relaunch a leg once its spline got stopped or replaced (e.g. while the
-                    // horse was briefly not allowed to move), it then idles forever and MovementInform never fires. Resume it.
                     if (me->movespline->Finalized())
                     {
-                        if (me->GetMotionMaster()->GetCurrentMovementGeneratorType() == WAYPOINT_MOTION_TYPE && !me->HasUnitState(UNIT_STATE_NOT_MOVE))
-                            me->ResumeMovement(0, MOTION_SLOT_IDLE);
+                        if (IsAtPathEnd())
+                        {
+                            OnPathEnded();
+                            break;
+                        }
 
                         // fail-safe: never leave the player locked on a horse that does not move anymore
                         if (++_stuckChecks >= CROWLEYS_HORSE_MAX_STUCK_CHECKS)
@@ -646,6 +711,9 @@ struct npc_crowleys_horse : public VehicleAI
                             _events.ScheduleEvent(EVENT_DISMOUNT_PLAYER, 1ms);
                             break;
                         }
+
+                        // the route spline got stopped or replaced: continue it from where the horse is
+                        LaunchPath(GetResumeNode());
                     }
                     else
                         _stuckChecks = 0;
