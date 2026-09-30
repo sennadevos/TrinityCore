@@ -453,12 +453,13 @@ struct npc_greymanes_horse : public VehicleAI
                     break;
                 case EVENT_ANNOUNCE_RESCUE:
                     me->SetControlled(true, UNIT_STATE_ROOT);
-                    if (Unit* passenger = me->GetVehicleKit()->GetPassenger(0))
-                    {
-                        Talk(SAY_ANNOUNCE_RESCUE, passenger);
-                        if (Creature* krennan = me->FindNearestCreature(NPC_TRAPPED_KRENNAN, 30.0f, true))
-                            krennan->AI()->Talk(SAY_TRAPPED, passenger);
-                    }
+                    if (Vehicle* vehicle = me->GetVehicleKit())
+                        if (Unit* passenger = vehicle->GetPassenger(0))
+                        {
+                            Talk(SAY_ANNOUNCE_RESCUE, passenger);
+                            if (Creature* krennan = me->FindNearestCreature(NPC_TRAPPED_KRENNAN, 30.0f, true))
+                                krennan->AI()->Talk(SAY_TRAPPED, passenger);
+                        }
                     break;
                 case EVENT_START_PATH_2:
                     me->SetControlled(true, UNIT_STATE_ROOT);
@@ -466,32 +467,33 @@ struct npc_greymanes_horse : public VehicleAI
                     me->GetMotionMaster()->MoveSmoothPath(pathSize2, greymanesHorsePath2, pathSize2);
                     break;
                 case EVENT_DISMOUNT_PLAYER:
-                    if (Unit* passenger = me->GetVehicleKit()->GetPassenger(1))
-                    {
-                        if (Unit* player = me->GetVehicleKit()->GetPassenger(0))
+                    if (Vehicle* vehicle = me->GetVehicleKit())
+                        if (Unit* passenger = vehicle->GetPassenger(1))
                         {
-                            if (Creature* krennan = passenger->ToCreature())
+                            if (Unit* player = vehicle->GetPassenger(0))
                             {
-                                std::vector<Unit*> storedAttackers;
-
-                                for (Unit* attacker : me->getAttackers())
-                                    storedAttackers.push_back(attacker);
-
-                                for (Unit* attacker : storedAttackers)
+                                if (Creature* krennan = passenger->ToCreature())
                                 {
-                                    if (Creature* creature = attacker->ToCreature())
-                                        if (creature->IsAIEnabled())
-                                            creature->AI()->EnterEvadeMode();
-                                }
+                                    std::vector<Unit*> storedAttackers;
 
-                                player->ExitVehicle();
-                                krennan->AddUnitState(UNIT_STATE_ROOT);
-                                krennan->ExitVehicle();
-                                krennan->AI()->Talk(SAY_RESCUED, me);
-                                krennan->DespawnOrUnsummon(7s);
+                                    for (Unit* attacker : me->getAttackers())
+                                        storedAttackers.push_back(attacker);
+
+                                    for (Unit* attacker : storedAttackers)
+                                    {
+                                        if (Creature* creature = attacker->ToCreature())
+                                            if (creature->IsAIEnabled())
+                                                creature->AI()->EnterEvadeMode();
+                                    }
+
+                                    player->ExitVehicle();
+                                    krennan->AddUnitState(UNIT_STATE_ROOT);
+                                    krennan->ExitVehicle();
+                                    krennan->AI()->Talk(SAY_RESCUED, me);
+                                    krennan->DespawnOrUnsummon(7s);
+                                }
                             }
                         }
-                    }
                     break;
                 default:
                     break;
