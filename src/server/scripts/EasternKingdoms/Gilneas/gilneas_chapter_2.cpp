@@ -680,6 +680,200 @@ class spell_gilneas_drowning_vehicle_exit_dummy : public SpellScript
     }
 };
 
+/*######
+## Quest 14416 - The Hungry Ettin
+## The player rides a Mountain Horse (36540, spellclick 94654) whose vehicle spell Round Up Horse (68903) triggers
+## Rope in Horse (68908) on another Mountain Horse: EFFECT_0 (dummy) on the targeted horse, EFFECT_1 summons a
+## Mountain Horse (36555) that has to follow the rider back to Lorna Crowley (36457), where it gives the
+## Mountain Horse Credit (36560, 5 needed). None of this was scripted (no spell scripts, no AI), so the targeted
+## horse stayed where it was and the summoned horse just stood next to it.
+######*/
+
+enum TheHungryEttin
+{
+    QUEST_THE_HUNGRY_ETTIN          = 14416,
+
+    NPC_MOUNTAIN_HORSE_VEHICLE      = 36540,
+    NPC_MOUNTAIN_HORSE_FOLLOWER     = 36555,
+    NPC_MOUNTAIN_HORSE_CREDIT       = 36560,
+    NPC_LORNA_CROWLEY               = 36457,
+
+    SPELL_ROPE_CHANNEL              = 68940,
+
+    EVENT_CHECK_FOLLOWER            = 1
+};
+
+static Player* GetMountainHorseRider(Unit* caster)
+{
+    if (!caster)
+        return nullptr;
+
+    if (Player* player = caster->GetCharmerOrOwnerPlayerOrPlayerItself())
+        return player;
+
+    if (Vehicle* vehicle = caster->GetVehicleKit())
+        if (Unit* passenger = vehicle->GetPassenger(SEAT_0))
+            return passenger->ToPlayer();
+
+    return nullptr;
+}
+
+// 68903 - Round Up Horse (vehicle spell of 36540, cast by the horse the player rides)
+class spell_gilneas_round_up_horse : public SpellScript
+{
+    SpellCastResult CheckCast()
+    {
+        Unit* target = GetExplTargetUnit();
+        if (!target || target == GetCaster() || target->GetTypeId() != TYPEID_UNIT || target->GetEntry() != NPC_MOUNTAIN_HORSE_VEHICLE || !target->IsAlive())
+            return SPELL_FAILED_BAD_TARGETS;
+
+        // don't rope a horse somebody is riding
+        if (Vehicle* vehicle = target->GetVehicleKit())
+            if (vehicle->IsVehicleInUse())
+                return SPELL_FAILED_BAD_TARGETS;
+
+        return SPELL_CAST_OK;
+    }
+
+    void Register() override
+    {
+        OnCheckCast.Register(&spell_gilneas_round_up_horse::CheckCast);
+    }
+};
+
+// 68908 - Rope in Horse (triggered by 68903)
+class spell_gilneas_rope_in_horse : public SpellScript
+{
+    void HandleDummy(SpellEffIndex /*effIndex*/)
+    {
+        // the roped horse is replaced by the following horse; respawn it after a short time for other players
+        if (Creature* horse = GetHitCreature())
+            if (horse->GetEntry() == NPC_MOUNTAIN_HORSE_VEHICLE && !(horse->GetVehicleKit() && horse->GetVehicleKit()->IsVehicleInUse()))
+                horse->DespawnOrUnsummon(0ms, 30s);
+    }
+
+    void HandleSummon(SpellEffIndex effIndex)
+    {
+        // the default summon would belong to the vehicle (the caster); the follower must belong to the rider
+        PreventHitDefaultEffect(effIndex);
+
+        Player* player = GetMountainHorseRider(GetCaster());
+        WorldLocation const* dest = GetHitDest();
+        if (!player || !dest)
+            return;
+
+        uint32 entry = GetSpellInfo()->Effects[effIndex].MiscValue;
+        if (!entry)
+            entry = NPC_MOUNTAIN_HORSE_FOLLOWER;
+
+        int32 duration = GetSpellInfo()->GetDuration();
+        if (duration <= 0)
+            duration = 20 * MINUTE * IN_MILLISECONDS;
+
+        player->SummonCreature(entry, dest->GetPosition(), TEMPSUMMON_TIMED_DESPAWN, uint32(duration));
+    }
+
+    void Register() override
+    {
+        OnEffectHitTarget.Register(&spell_gilneas_rope_in_horse::HandleDummy, EFFECT_0, SPELL_EFFECT_DUMMY);
+        OnEffectHit.Register(&spell_gilneas_rope_in_horse::HandleSummon, EFFECT_1, SPELL_EFFECT_SUMMON);
+    }
+};
+
+// 36555 - Mountain Horse (roped, follows the rider)
+struct npc_gilneas_mountain_horse_follower : public ScriptedAI
+{
+    npc_gilneas_mountain_horse_follower(Creature* creature) : ScriptedAI(creature), _followAngle(float(M_PI)) { }
+
+    void IsSummonedBy(Unit* summoner) override
+    {
+        if (!summoner || summoner->GetTypeId() != TYPEID_PLAYER)
+        {
+            me->DespawnOrUnsummon();
+            return;
+        }
+
+        _playerGUID = summoner->GetGUID();
+        _followAngle = frand(float(M_PI) * 0.65f, float(M_PI) * 1.35f); // behind the rider, spread out when there are several
+        me->SetReactState(REACT_PASSIVE);
+        UpdateFollowTarget(summoner->ToPlayer());
+        _events.ScheduleEvent(EVENT_CHECK_FOLLOWER, 1s);
+    }
+
+    // don't return home / leave the rider when something attacked the horse
+    void EnterEvadeMode(EvadeReason why) override
+    {
+        if (!_EnterEvadeMode(why))
+            return;
+
+        if (Player* player = ObjectAccessor::GetPlayer(*me, _playerGUID))
+        {
+            _followTargetGUID.Clear();
+            UpdateFollowTarget(player);
+        }
+    }
+
+    void UpdateAI(uint32 diff) override
+    {
+        _events.Update(diff);
+
+        while (uint32 eventId = _events.ExecuteEvent())
+        {
+            switch (eventId)
+            {
+                case EVENT_CHECK_FOLLOWER:
+                {
+                    Player* player = ObjectAccessor::GetPlayer(*me, _playerGUID);
+                    if (!player || !player->IsAlive() || player->GetMapId() != me->GetMapId() || !me->IsWithinDist(player, 100.0f)
+                        || player->GetQuestStatus(QUEST_THE_HUNGRY_ETTIN) != QUEST_STATUS_INCOMPLETE)
+                    {
+                        me->DespawnOrUnsummon();
+                        return;
+                    }
+
+                    if (me->FindNearestCreature(NPC_LORNA_CROWLEY, 20.0f))
+                    {
+                        player->KilledMonsterCredit(NPC_MOUNTAIN_HORSE_CREDIT);
+                        me->InterruptNonMeleeSpells(false);
+                        me->GetMotionMaster()->Clear();
+                        me->StopMoving();
+                        me->DespawnOrUnsummon(2s);
+                        return;
+                    }
+
+                    UpdateFollowTarget(player);
+                    _events.Repeat(1s);
+                    break;
+                }
+                default:
+                    break;
+            }
+        }
+    }
+
+private:
+    // follow the horse the player rides (its speed, not the player's), or the player when on foot
+    void UpdateFollowTarget(Player* player)
+    {
+        Unit* target = player->GetVehicleBase();
+        if (!target)
+            target = player;
+
+        if (target->GetGUID() == _followTargetGUID && me->GetMotionMaster()->GetCurrentMovementGeneratorType() == FOLLOW_MOTION_TYPE)
+            return;
+
+        _followTargetGUID = target->GetGUID();
+        me->InterruptNonMeleeSpells(false);
+        me->CastSpell(target, SPELL_ROPE_CHANNEL, true);
+        me->GetMotionMaster()->MoveFollow(target, 3.0f, _followAngle, false, true);
+    }
+
+    EventMap _events;
+    ObjectGuid _playerGUID;
+    ObjectGuid _followTargetGUID;
+    float _followAngle;
+};
+
 class at_gasping_for_breath : public AreaTriggerScript
 {
 public:
@@ -716,4 +910,7 @@ void AddSC_gilneas_chapter_2()
     RegisterSpellScript(spell_gilneas_save_drowning_milita_effect);
     RegisterSpellScript(spell_gilneas_drowning_vehicle_exit_dummy);
     new at_gasping_for_breath();
+    RegisterSpellScript(spell_gilneas_round_up_horse);
+    RegisterSpellScript(spell_gilneas_rope_in_horse);
+    RegisterCreatureAI(npc_gilneas_mountain_horse_follower);
 }
